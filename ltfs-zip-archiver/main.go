@@ -143,6 +143,60 @@ func (pr *ProgressReader) Read(p []byte) (n int, err error) {
 	return n, err
 }
 
+// BufferedWriter 提供带缓冲区的写入器
+type BufferedWriter struct {
+	writer io.Writer
+	buffer []byte
+	offset int
+}
+
+func NewBufferedWriter(writer io.Writer, bufSize int) *BufferedWriter {
+	return &BufferedWriter{
+		writer: writer,
+		buffer: make([]byte, bufSize),
+		offset: 0,
+	}
+}
+
+func (bw *BufferedWriter) Write(p []byte) (n int, err error) {
+	n = len(p)
+	remaining := len(p)
+	srcOffset := 0
+
+	for remaining > 0 {
+		available := len(bw.buffer) - bw.offset
+		if available == 0 {
+			// 缓冲区已满，刷新
+			if err = bw.Flush(); err != nil {
+				return n - remaining, err
+			}
+			available = len(bw.buffer)
+		}
+
+		copySize := remaining
+		if copySize > available {
+			copySize = available
+		}
+
+		copy(bw.buffer[bw.offset:], p[srcOffset:srcOffset+copySize])
+		bw.offset += copySize
+		srcOffset += copySize
+		remaining -= copySize
+	}
+
+	return n, nil
+}
+
+func (bw *BufferedWriter) Flush() error {
+	if bw.offset == 0 {
+		return nil
+	}
+
+	_, err := bw.writer.Write(bw.buffer[:bw.offset])
+	bw.offset = 0
+	return err
+}
+
 func main() {
 	// 1. 检查命令行参数
 	if len(os.Args) < 2 {
@@ -277,9 +331,15 @@ func main() {
 		}
 	}()
 
+	// 创建带缓冲的文件写入器，使用10MB缓冲区
+	bufferedFile := NewBufferedWriter(file, 10*1024*1024)
+
 	// 创建 Zip Writer
-	zipWriter := zip.NewWriter(file)
-	defer zipWriter.Close()
+	zipWriter := zip.NewWriter(bufferedFile)
+	defer func() {
+		zipWriter.Close()
+		bufferedFile.Flush()
+	}()
 
 	// 将进度条实例、速度跟踪器和暂停控制器传递给 addFiles 函数
 	if err := addFiles(zipWriter, source, bar, speedTracker, pauseController); err != nil {
@@ -310,6 +370,9 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 		baseDir = filepath.Dir(basePath)
 	}
 
+	// 使用更大的缓冲区进行文件复制
+	copyBuffer := make([]byte, 1024*1024) // 1MB缓冲区
+
 	return filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -318,6 +381,10 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 		// 检查是否暂停
 		if pauseController != nil {
 			pauseController.WaitIfPaused()
+		}
+
+		if bar != nil {
+			log.Printf("处理中: %s", path)
 		}
 
 		header, err := zip.FileInfoHeader(info)
@@ -348,20 +415,40 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 			}
 			defer file.Close()
 
-			// 使用 ProgressReader 包装文件读取器，以跟踪进度、速度和暂停控制
-			var reader io.Reader = file
-			if bar != nil && speedTracker != nil && pauseController != nil {
-				reader = NewProgressReader(file, bar, speedTracker, pauseController)
-			} else if bar != nil && speedTracker != nil {
-				reader = NewProgressReader(file, bar, speedTracker, nil)
-			} else if bar != nil {
-				// 如果只有进度条没有速度跟踪器，使用 TeeReader
-				reader = io.TeeReader(file, bar)
-			}
+			// 使用带缓冲区的高效复制
+			if bar != nil || speedTracker != nil || pauseController != nil {
+				for {
+					if pauseController != nil {
+						pauseController.WaitIfPaused()
+					}
 
-			_, err = io.Copy(writer, reader)
-			if err != nil {
-				return err
+					n, err := file.Read(copyBuffer)
+					if n > 0 {
+						if _, writeErr := writer.Write(copyBuffer[:n]); writeErr != nil {
+							return writeErr
+						}
+
+						// 更新进度和速度
+						if bar != nil {
+							bar.Add(n)
+						}
+						if speedTracker != nil {
+							speedTracker.Update(int64(n))
+						}
+					}
+					if err != nil {
+						if err == io.EOF {
+							break
+						}
+						return err
+					}
+				}
+			} else {
+				// 没有进度跟踪时使用标准复制
+				_, err = io.CopyBuffer(writer, file, copyBuffer)
+				if err != nil {
+					return err
+				}
 			}
 		}
 		return nil
