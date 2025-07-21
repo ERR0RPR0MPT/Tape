@@ -35,10 +35,8 @@ func (pc *PauseController) Toggle() {
 
 	if atomic.LoadInt32(&pc.paused) == 0 {
 		atomic.StoreInt32(&pc.paused, 1)
-		fmt.Fprintln(os.Stderr, "\n[暂停] 按回车键继续...")
 	} else {
 		atomic.StoreInt32(&pc.paused, 0)
-		fmt.Fprintln(os.Stderr, "[继续] 按回车键暂停...")
 		pc.cond.Broadcast()
 	}
 }
@@ -106,41 +104,6 @@ func (st *SpeedTracker) GetSpeedString() string {
 	} else {
 		return fmt.Sprintf("%.1f GB/s", speed/1024/1024/1024)
 	}
-}
-
-// ProgressReader 包装 io.Reader 以跟踪读取的字节数
-type ProgressReader struct {
-	reader          io.Reader
-	bar             *progressbar.ProgressBar
-	speedTracker    *SpeedTracker
-	pauseController *PauseController
-}
-
-func NewProgressReader(reader io.Reader, bar *progressbar.ProgressBar, speedTracker *SpeedTracker, pauseController *PauseController) *ProgressReader {
-	return &ProgressReader{
-		reader:          reader,
-		bar:             bar,
-		speedTracker:    speedTracker,
-		pauseController: pauseController,
-	}
-}
-
-func (pr *ProgressReader) Read(p []byte) (n int, err error) {
-	// 检查是否暂停
-	if pr.pauseController != nil {
-		pr.pauseController.WaitIfPaused()
-	}
-
-	n, err = pr.reader.Read(p)
-	if n > 0 {
-		if pr.bar != nil {
-			pr.bar.Add(n)
-		}
-		if pr.speedTracker != nil {
-			pr.speedTracker.Update(int64(n))
-		}
-	}
-	return n, err
 }
 
 // BufferedWriter 提供带缓冲区的写入器
@@ -301,11 +264,10 @@ func main() {
 	// 初始化进度条
 	bar := progressbar.NewOptions64(
 		totalSize,
-		progressbar.OptionSetDescription(fmt.Sprintf("正在压缩到 %s", filepath.Base(destFile))),
-		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionSetWriter(os.Stderr), // 明确指定输出到 stderr
 		progressbar.OptionShowBytes(true),
 		progressbar.OptionSetWidth(15),
-		progressbar.OptionThrottle(100*time.Millisecond), // 降低默认的更新频率
+		progressbar.OptionThrottle(200*time.Millisecond), // 稍微降低更新频率
 		progressbar.OptionShowCount(),
 		progressbar.OptionOnCompletion(func() {
 			fmt.Fprint(os.Stderr, "\n")
@@ -320,10 +282,13 @@ func main() {
 			BarEnd:        "]",
 		}),
 		progressbar.OptionSetRenderBlankState(true),
+		progressbar.OptionClearOnFinish(), // 完成后清除进度条
 	)
 
 	// 启动协程监听键盘输入
 	go func() {
+		// 确保在程序退出时能关闭标准输入，让 goroutine 结束
+		defer os.Stdin.Close()
 		scanner := bufio.NewScanner(os.Stdin)
 		for scanner.Scan() {
 			pauseController.Toggle()
@@ -353,7 +318,7 @@ func main() {
 				if cf := currentFile.Load(); cf != nil {
 					filePath = cf.(string)
 				}
-				maxPathLen := 10 // 路径最大显示长度
+				maxPathLen := 16 // 路径最大显示长度
 				if len(filePath) > maxPathLen {
 					filePath = "..." + filePath[len(filePath)-maxPathLen+3:]
 				}
@@ -368,7 +333,7 @@ func main() {
 	}()
 
 	// 创建带缓冲的文件写入器
-	bufferedFile := NewBufferedWriter(file, 10*1024*1024)
+	bufferedFile := NewBufferedWriter(file, 10*1024*1024) // 10MB buffer
 
 	// 创建 Zip Writer
 	zipWriter := zip.NewWriter(bufferedFile)
@@ -380,7 +345,9 @@ func main() {
 	// 遍历所有源，将它们添加到zip中
 	for _, source := range sources {
 		if err := addFiles(zipWriter, source, bar, speedTracker, pauseController, &currentFile); err != nil {
-			done <- true
+			done <- true // 发生错误，通知更新 goroutine 停止
+			// 在新行打印错误，避免与进度条混淆
+			fmt.Fprintf(os.Stderr, "\n")
 			log.Fatalf("错误: 压缩 '%s' 过程中发生错误: %v", source, err)
 		}
 	}
@@ -408,19 +375,19 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 		baseDir = filepath.Dir(basePath)
 	}
 
-	copyBuffer := make([]byte, 1024*1024) // 1MB缓冲区
+	copyBuffer := make([]byte, 5*1024*1024) // 5MB缓冲区
 
 	return filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 
-		if pauseController != nil {
-			pauseController.WaitIfPaused()
-		}
+		pauseController.WaitIfPaused()
 
 		// 更新当前正在处理的文件名，供进度条显示
-		currentFile.Store(path)
+		// 使用相对路径以获得更简洁的显示
+		relPathForDisplay, _ := filepath.Rel(baseDir, path)
+		currentFile.Store(relPathForDisplay)
 
 		header, err := zip.FileInfoHeader(info)
 		if err != nil {
@@ -457,9 +424,7 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 			defer file.Close()
 
 			for {
-				if pauseController != nil {
-					pauseController.WaitIfPaused()
-				}
+				pauseController.WaitIfPaused()
 
 				n, err := file.Read(copyBuffer)
 				if n > 0 {
@@ -467,12 +432,8 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 						return writeErr
 					}
 
-					if bar != nil {
-						bar.Add(n)
-					}
-					if speedTracker != nil {
-						speedTracker.Update(int64(n))
-					}
+					bar.Add(n)
+					speedTracker.Update(int64(n))
 				}
 				if err != nil {
 					if err == io.EOF {
