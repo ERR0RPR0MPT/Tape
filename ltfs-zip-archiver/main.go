@@ -197,63 +197,81 @@ func (bw *BufferedWriter) Flush() error {
 	return err
 }
 
-func main() {
-	// 1. 检查命令行参数
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "用法: %s <要压缩的文件或目录> [可选的目标zip文件]\n", os.Args[0])
-		fmt.Fprintln(os.Stderr, "如果未提供目标zip文件，将输出到标准输出 (stdout)。")
-		os.Exit(1)
+// readLines 从指定文件中读取所有行，并去除每行首尾的引号和空白
+func readLines(path string) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
 	}
+	defer file.Close()
 
-	source := os.Args[1]
-	isWritingToFile := len(os.Args) > 2
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		line = strings.Trim(line, "\"") // 去除可能存在的引号
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines, scanner.Err()
+}
 
+func main() {
 	// 配置日志记录器
 	log.SetFlags(log.LstdFlags) // 设置日志格式为 YYYY/MM/DD HH:MM:SS
 
-	// 如果输出到 stdout，禁用日志和进度条，直接执行简单压缩
-	if !isWritingToFile {
-		zipWriter := zip.NewWriter(os.Stdout)
-		defer zipWriter.Close()
-		if err := addFiles(zipWriter, source, nil, nil, nil); err != nil {
-			fmt.Fprintf(os.Stderr, "压缩过程中发生错误: %v\n", err)
-			os.Exit(1)
-		}
-		return
-	}
-
-	// --- 以下为写入文件时的逻辑 ---
-
-	destFile := os.Args[2]
-	// 确保不会将输出文件打包到自身
-	absSource, err := filepath.Abs(source)
+	// 1. 从 src.txt 和 dst.txt 读取配置
+	sources, err := readLines("src.txt")
 	if err != nil {
-		log.Fatalf("错误: 无法获取源绝对路径: %v", err)
+		log.Fatalf("错误: 无法读取源文件列表 src.txt: %v", err)
 	}
+	if len(sources) == 0 {
+		log.Fatalln("错误: src.txt 为空或不存在。")
+	}
+
+	destLines, err := readLines("dst.txt")
+	if err != nil {
+		log.Fatalf("错误: 无法读取目标文件配置 dst.txt: %v", err)
+	}
+	if len(destLines) == 0 {
+		log.Fatalln("错误: dst.txt 为空或不存在。")
+	}
+	destFile := destLines[0]
+
+	// 确保不会将输出文件打包到自身
 	absDest, err := filepath.Abs(destFile)
 	if err != nil {
 		log.Fatalf("错误: 无法获取目标绝对路径: %v", err)
 	}
-	if strings.HasPrefix(absDest, absSource) {
-		log.Fatalln("错误: 目标zip文件不能位于源目录中。")
+	for _, source := range sources {
+		absSource, err := filepath.Abs(source)
+		if err != nil {
+			log.Fatalf("错误: 无法获取源 '%s' 的绝对路径: %v", source, err)
+		}
+		if strings.HasPrefix(absDest, absSource) {
+			log.Fatalf("错误: 目标zip文件 '%s' 不能位于源目录 '%s' 中。", destFile, source)
+		}
 	}
 
 	// --- 阶段 1: 扫描文件以统计总数和大小 ---
 	log.Println("阶段 1/2: 正在扫描文件...")
 	var totalFiles int64
 	var totalSize int64
-	err = filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
+	for _, source := range sources {
+		err := filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() {
+				totalFiles++
+				totalSize += info.Size()
+			}
+			return nil
+		})
 		if err != nil {
-			return err
+			log.Fatalf("错误: 扫描文件 '%s' 时出错: %v", source, err)
 		}
-		if !info.IsDir() {
-			totalFiles++
-			totalSize += info.Size()
-		}
-		return nil
-	})
-	if err != nil {
-		log.Fatalf("错误: 扫描文件时出错: %v", err)
 	}
 	log.Printf("扫描完成。共找到 %d 个文件, 总大小 %.2f MB\n", totalFiles, float64(totalSize)/1024/1024)
 
@@ -273,11 +291,11 @@ func main() {
 	// 初始化速度跟踪器
 	speedTracker := NewSpeedTracker()
 
-	// 初始化进度条，添加自定义格式以显示速度
+	// 初始化进度条
 	bar := progressbar.NewOptions64(
-		totalSize, // 总大小
+		totalSize,
 		progressbar.OptionSetDescription(fmt.Sprintf("正在压缩到 %s", filepath.Base(destFile))),
-		progressbar.OptionSetWriter(os.Stderr), // 将进度条写入 stderr，避免干扰 stdout
+		progressbar.OptionSetWriter(os.Stderr),
 		progressbar.OptionShowBytes(true),
 		progressbar.OptionSetWidth(15),
 		progressbar.OptionThrottle(65*time.Millisecond),
@@ -294,7 +312,6 @@ func main() {
 			BarStart:      "[",
 			BarEnd:        "]",
 		}),
-		// 添加自定义模板以显示速度
 		progressbar.OptionSetRenderBlankState(true),
 	)
 
@@ -331,7 +348,7 @@ func main() {
 		}
 	}()
 
-	// 创建带缓冲的文件写入器，使用10MB缓冲区
+	// 创建带缓冲的文件写入器
 	bufferedFile := NewBufferedWriter(file, 10*1024*1024)
 
 	// 创建 Zip Writer
@@ -341,22 +358,21 @@ func main() {
 		bufferedFile.Flush()
 	}()
 
-	// 将进度条实例、速度跟踪器和暂停控制器传递给 addFiles 函数
-	if err := addFiles(zipWriter, source, bar, speedTracker, pauseController); err != nil {
-		done <- true // 停止速度更新协程
-		log.Fatalf("错误: 压缩过程中发生错误: %v", err)
+	// 遍历所有源，将它们添加到zip中
+	for _, source := range sources {
+		if err := addFiles(zipWriter, source, bar, speedTracker, pauseController); err != nil {
+			done <- true
+			log.Fatalf("错误: 压缩 '%s' 过程中发生错误: %v", source, err)
+		}
 	}
 
-	// 停止速度更新协程
 	done <- true
 
-	// 显示最终速度统计
 	finalSpeed := speedTracker.GetSpeedString()
 	log.Printf("压缩完成。平均速度: %s", finalSpeed)
 }
 
 // addFiles 遍历路径并将其中的文件和目录添加到zip.Writer中
-// 新增了一个 *progressbar.ProgressBar 参数、*SpeedTracker 参数和 *PauseController 参数
 func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, speedTracker *SpeedTracker, pauseController *PauseController) error {
 	info, err := os.Stat(basePath)
 	if err != nil {
@@ -367,10 +383,10 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 	if info.IsDir() {
 		baseDir = basePath
 	} else {
+		// 如果 basePath 是一个文件，则其父目录是 baseDir
 		baseDir = filepath.Dir(basePath)
 	}
 
-	// 使用更大的缓冲区进行文件复制
 	copyBuffer := make([]byte, 1024*1024) // 1MB缓冲区
 
 	return filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
@@ -378,7 +394,6 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 			return err
 		}
 
-		// 检查是否暂停
 		if pauseController != nil {
 			pauseController.WaitIfPaused()
 		}
@@ -392,10 +407,16 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 			return err
 		}
 
+		// 创建正确的相对路径
 		relPath, err := filepath.Rel(baseDir, path)
 		if err != nil {
 			return err
 		}
+		// 如果源本身是文件，我们希望它在zip的根目录
+		if !info.IsDir() && baseDir == filepath.Dir(basePath) && basePath == path {
+			relPath = filepath.Base(path)
+		}
+
 		header.Name = filepath.ToSlash(relPath)
 		header.Method = zip.Store // 不压缩
 
@@ -415,38 +436,28 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 			}
 			defer file.Close()
 
-			// 使用带缓冲区的高效复制
-			if bar != nil || speedTracker != nil || pauseController != nil {
-				for {
-					if pauseController != nil {
-						pauseController.WaitIfPaused()
+			for {
+				if pauseController != nil {
+					pauseController.WaitIfPaused()
+				}
+
+				n, err := file.Read(copyBuffer)
+				if n > 0 {
+					if _, writeErr := writer.Write(copyBuffer[:n]); writeErr != nil {
+						return writeErr
 					}
 
-					n, err := file.Read(copyBuffer)
-					if n > 0 {
-						if _, writeErr := writer.Write(copyBuffer[:n]); writeErr != nil {
-							return writeErr
-						}
-
-						// 更新进度和速度
-						if bar != nil {
-							bar.Add(n)
-						}
-						if speedTracker != nil {
-							speedTracker.Update(int64(n))
-						}
+					if bar != nil {
+						bar.Add(n)
 					}
-					if err != nil {
-						if err == io.EOF {
-							break
-						}
-						return err
+					if speedTracker != nil {
+						speedTracker.Update(int64(n))
 					}
 				}
-			} else {
-				// 没有进度跟踪时使用标准复制
-				_, err = io.CopyBuffer(writer, file, copyBuffer)
 				if err != nil {
+					if err == io.EOF {
+						break
+					}
 					return err
 				}
 			}
