@@ -218,6 +218,9 @@ func readLines(path string) ([]string, error) {
 }
 
 func main() {
+	// 记录开始时间
+	startTime := time.Now()
+
 	// 配置日志记录器
 	log.SetFlags(log.LstdFlags) // 设置日志格式为 YYYY/MM/DD HH:MM:SS
 
@@ -291,6 +294,10 @@ func main() {
 	// 初始化速度跟踪器
 	speedTracker := NewSpeedTracker()
 
+	// 用于在 goroutine 之间共享当前处理的文件名
+	var currentFile atomic.Value
+	currentFile.Store("") // 初始化为空字符串
+
 	// 初始化进度条
 	bar := progressbar.NewOptions64(
 		totalSize,
@@ -298,7 +305,7 @@ func main() {
 		progressbar.OptionSetWriter(os.Stderr),
 		progressbar.OptionShowBytes(true),
 		progressbar.OptionSetWidth(15),
-		progressbar.OptionThrottle(65*time.Millisecond),
+		progressbar.OptionThrottle(100*time.Millisecond), // 降低默认的更新频率
 		progressbar.OptionShowCount(),
 		progressbar.OptionOnCompletion(func() {
 			fmt.Fprint(os.Stderr, "\n")
@@ -323,10 +330,10 @@ func main() {
 		}
 	}()
 
-	// 启动一个协程定期更新进度条描述以显示速度和暂停状态
+	// 启动一个协程定期更新进度条描述以显示速度、暂停状态和当前文件
 	done := make(chan bool)
 	go func() {
-		ticker := time.NewTicker(500 * time.Millisecond)
+		ticker := time.NewTicker(200 * time.Millisecond) // 更新频率设为 200ms
 		defer ticker.Stop()
 
 		baseName := filepath.Base(destFile)
@@ -340,9 +347,21 @@ func main() {
 				} else {
 					statusStr = fmt.Sprintf("[%s]", speedStr)
 				}
-				newDesc := fmt.Sprintf("正在压缩到 %s %s", baseName, statusStr)
+
+				// 获取当前文件名并缩短
+				filePath := ""
+				if cf := currentFile.Load(); cf != nil {
+					filePath = cf.(string)
+				}
+				maxPathLen := 10 // 路径最大显示长度
+				if len(filePath) > maxPathLen {
+					filePath = "..." + filePath[len(filePath)-maxPathLen+3:]
+				}
+
+				newDesc := fmt.Sprintf("压缩中 %s %s %s", statusStr, baseName, filePath)
 				bar.Describe(newDesc)
 			case <-done:
+				bar.Describe(fmt.Sprintf("压缩完成: %s", baseName))
 				return
 			}
 		}
@@ -360,20 +379,22 @@ func main() {
 
 	// 遍历所有源，将它们添加到zip中
 	for _, source := range sources {
-		if err := addFiles(zipWriter, source, bar, speedTracker, pauseController); err != nil {
+		if err := addFiles(zipWriter, source, bar, speedTracker, pauseController, &currentFile); err != nil {
 			done <- true
 			log.Fatalf("错误: 压缩 '%s' 过程中发生错误: %v", source, err)
 		}
 	}
 
-	done <- true
+	done <- true // 通知进度条更新 goroutine 退出
+	bar.Finish() // 确保进度条达到100%
 
-	finalSpeed := speedTracker.GetSpeedString()
-	log.Printf("压缩完成。平均速度: %s", finalSpeed)
+	// 计算并打印总耗时
+	duration := time.Since(startTime)
+	log.Printf("压缩完成。总共用时: %.2f 秒", duration.Seconds())
 }
 
 // addFiles 遍历路径并将其中的文件和目录添加到zip.Writer中
-func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, speedTracker *SpeedTracker, pauseController *PauseController) error {
+func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, speedTracker *SpeedTracker, pauseController *PauseController, currentFile *atomic.Value) error {
 	info, err := os.Stat(basePath)
 	if err != nil {
 		return err
@@ -398,9 +419,8 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 			pauseController.WaitIfPaused()
 		}
 
-		if bar != nil {
-			log.Printf("处理中: %s", path)
-		}
+		// 更新当前正在处理的文件名，供进度条显示
+		currentFile.Store(path)
 
 		header, err := zip.FileInfoHeader(info)
 		if err != nil {
