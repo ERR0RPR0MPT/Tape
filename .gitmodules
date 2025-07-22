@@ -1,0 +1,3 @@
+[submodule "ltfs-zip-archiver"]
+	path = ltfs-zip-archiver
+	url = https://github.com/ERR0RPR0MPT/ltfs-zip-archiver.git
