@@ -8,9 +8,9 @@ CSV 表格格式请见 [index.csv](https://github.com/ERR0RPR0MPT/Tape/blob/main
 
 AI 生成的索引整理说明请见 [INDEX.md](https://github.com/ERR0RPR0MPT/Tape/blob/main/INDEX.md)
 
-## 数据存取方案：LTFS + Zip Archive
+## 数据存取方案：LTFS + LTFS ZIP Archiver
 
-经过多个方案的尝试，我选择 LTFS + Zip Archive 直接写入数据到磁带 (LTO 5+)。
+经过多个方案的尝试，我选择 LTFS + LTFS ZIP Archiver 直接写入数据到磁带 (LTO 5+)。
 
 加密使用 [LTOEnc](https://github.com/ERR0RPR0MPT/Tape/blob/main/LTOEnc) 开启磁带机自带的硬件加密。
 
@@ -19,6 +19,8 @@ AI 生成的索引整理说明请见 [INDEX.md](https://github.com/ERR0RPR0MPT/T
 使用自实现的 [LTFS ZIP Archiver](https://github.com/ERR0RPR0MPT/Tape/blob/main/ltfs-zip-archiver) 创建 zip 档案。
 
 LTFS ZIP Archiver 实现了按顺序写入 zip 档案压缩数据，适用于写入磁带，防止倒带降低速度。
+
+经测试，此方案即使在处理大量小文件时，也能保持满速写入（140+ MB/s, LTO 5）
 
 ### 优点
 
