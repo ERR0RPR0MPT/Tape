@@ -1,6 +1,6 @@
 # LTFS ZIP Archiver
 
-使用自实现的 [LTFS ZIP Archiver](https://github.com/ERR0RPR0MPT/Tape/blob/main/ltfs-zip-archiver) 创建 zip 档案。
+使用自实现的 LTFS ZIP Archiver 创建 zip 档案。
 
 LTFS ZIP Archiver 实现了按顺序写入 zip 档案压缩数据，适用于写入磁带，防止倒带降低速度。
 
