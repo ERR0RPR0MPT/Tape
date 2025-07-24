@@ -1,0 +1,1 @@
+$file="sdcard_bak.tar";$port=9999;$listener=New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Any,$port);$listener.Start();$client=$listener.AcceptTcpClient();$stream=$client.GetStream();$fs=[System.IO.File]::Create($file);$stream.CopyTo($fs);$fs.Close();$client.Close();$listener.Stop()
