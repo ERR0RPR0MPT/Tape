@@ -12,40 +12,100 @@ import (
 )
 
 const (
-	bufferSize = 10 * 1024 * 1024 // 10MB buffer for reading files
+	bufferSize     = 10 * 1024 * 1024       // 10MB buffer for reading files
+	updateInterval = 500 * time.Millisecond // Update progress every 500ms
 )
 
 type ProgressTracker struct {
-	totalBytes     int64
-	processedBytes int64
-	startTime      time.Time
-	filename       string
+	totalBytes         int64
+	processedBytes     int64
+	startTime          time.Time
+	lastUpdateTime     time.Time
+	lastProcessedBytes int64
+	filename           string
+	currentSpeed       float64
+	avgSpeed           float64
 }
 
 func (p *ProgressTracker) reset(totalBytes int64, filename string) {
 	p.totalBytes = totalBytes
 	p.processedBytes = 0
 	p.startTime = time.Now()
+	p.lastUpdateTime = time.Now()
+	p.lastProcessedBytes = 0
 	p.filename = filename
+	p.currentSpeed = 0
+	p.avgSpeed = 0
 }
 
 func (p *ProgressTracker) update(bytesRead int64) {
 	p.processedBytes += bytesRead
+	now := time.Now()
 
+	// Calculate current speed (bytes per second)
+	if now.Sub(p.lastUpdateTime) >= updateInterval {
+		bytesInInterval := p.processedBytes - p.lastProcessedBytes
+		timeInterval := now.Sub(p.lastUpdateTime).Seconds()
+
+		if timeInterval > 0 {
+			p.currentSpeed = float64(bytesInInterval) / timeInterval
+		}
+
+		// Calculate average speed since start
+		totalElapsed := now.Sub(p.startTime).Seconds()
+		if totalElapsed > 0 {
+			p.avgSpeed = float64(p.processedBytes) / totalElapsed
+		}
+
+		p.lastUpdateTime = now
+		p.lastProcessedBytes = p.processedBytes
+
+		p.displayProgress()
+	}
+}
+
+func (p *ProgressTracker) displayProgress() {
 	elapsed := time.Since(p.startTime)
 	percentage := float64(p.processedBytes) / float64(p.totalBytes) * 100
 
-	if p.processedBytes > 0 {
-		estimatedTotal := time.Duration(float64(elapsed) / float64(p.processedBytes) * float64(p.totalBytes))
+	// Clear the line and display progress
+	fmt.Print("\r\033[K")
+
+	if p.processedBytes > 0 && p.avgSpeed > 0 {
+		estimatedTotal := time.Duration(float64(p.totalBytes) / p.avgSpeed * float64(time.Second))
 		remaining := estimatedTotal - elapsed
 
-		fmt.Printf("\r进度: %.2f%% (%s/%s) | 文件: %s | 剩余时间: %s",
+		if remaining < 0 {
+			remaining = 0
+		}
+
+		fmt.Printf("进度: %.2f%% | %s/%s | 当前速度: %s/s | 平均速度: %s/s | 已用时: %s | 剩余: %s",
 			percentage,
 			formatBytes(p.processedBytes),
 			formatBytes(p.totalBytes),
-			filepath.Base(p.filename),
+			formatBytes(int64(p.currentSpeed)),
+			formatBytes(int64(p.avgSpeed)),
+			formatDuration(elapsed),
 			formatDuration(remaining))
+	} else {
+		fmt.Printf("进度: %.2f%% | %s/%s | 已用时: %s",
+			percentage,
+			formatBytes(p.processedBytes),
+			formatBytes(p.totalBytes),
+			formatDuration(elapsed))
 	}
+}
+
+func (p *ProgressTracker) finish() {
+	fmt.Println() // New line after progress
+	elapsed := time.Since(p.startTime)
+	finalSpeed := float64(p.totalBytes) / elapsed.Seconds()
+
+	log.Printf("处理完成统计:")
+	log.Printf("- 总字节数: %s", formatBytes(p.totalBytes))
+	log.Printf("- 总用时: %s", formatDuration(elapsed))
+	log.Printf("- 平均速度: %s/s", formatBytes(int64(finalSpeed)))
+	log.Printf("- 最高速度: %s/s", formatBytes(int64(p.currentSpeed)))
 }
 
 func formatBytes(bytes int64) string {
@@ -90,6 +150,10 @@ func generateSHA256(filename string, tracker *ProgressTracker) (string, error) {
 	hash := sha256.New()
 	buffer := make([]byte, bufferSize)
 
+	log.Printf("开始计算SHA256哈希值...")
+	log.Printf("缓冲区大小: %s", formatBytes(bufferSize))
+	log.Println()
+
 	for {
 		n, err := file.Read(buffer)
 		if n > 0 {
@@ -104,6 +168,7 @@ func generateSHA256(filename string, tracker *ProgressTracker) (string, error) {
 		}
 	}
 
+	tracker.finish()
 	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }
 
@@ -124,7 +189,9 @@ func generateSHA256File(filename string) error {
 	tracker := &ProgressTracker{}
 	tracker.reset(info.Size(), filename)
 
-	log.Printf("处理文件: %s (大小: %s)\n", filename, formatBytes(info.Size()))
+	log.Printf("目标文件: %s", filename)
+	log.Printf("文件大小: %s", formatBytes(info.Size()))
+	log.Printf("修改时间: %s", info.ModTime().Format("2006-01-02 15:04:05"))
 	log.Println()
 
 	hash, err := generateSHA256(filename, tracker)
@@ -141,9 +208,10 @@ func generateSHA256File(filename string) error {
 		return fmt.Errorf("无法写入SHA256文件 %s: %v", sha256Filename, err)
 	}
 
-	log.Printf("\n\n=== 生成完成 ===\n")
-	log.Printf("✓ 生成: %s\n", sha256Filename)
-	log.Printf("用时: %s\n", formatDuration(time.Since(tracker.startTime)))
+	log.Println()
+	log.Printf("=== 生成完成 ===")
+	log.Printf("✓ SHA256值: %s", hash)
+	log.Printf("✓ 输出文件: %s", sha256Filename)
 
 	return nil
 }
@@ -164,6 +232,12 @@ func verifySHA256File(filename string) error {
 		return fmt.Errorf("不能处理目录: %s", filename)
 	}
 
+	// 检查SHA256文件是否存在
+	sha256Info, err := os.Stat(sha256Filename)
+	if err != nil {
+		return fmt.Errorf("SHA256文件不存在: %s", sha256Filename)
+	}
+
 	// 读取SHA256文件
 	sha256Content, err := os.ReadFile(sha256Filename)
 	if err != nil {
@@ -179,45 +253,64 @@ func verifySHA256File(filename string) error {
 
 	expectedHash := parts[0]
 
+	log.Printf("目标文件: %s", filename)
+	log.Printf("文件大小: %s", formatBytes(info.Size()))
+	log.Printf("修改时间: %s", info.ModTime().Format("2006-01-02 15:04:05"))
+	log.Printf("校验文件: %s", sha256Filename)
+	log.Printf("校验文件创建时间: %s", sha256Info.ModTime().Format("2006-01-02 15:04:05"))
+	log.Printf("期望SHA256: %s", expectedHash)
+	log.Println()
+
 	tracker := &ProgressTracker{}
 	tracker.reset(info.Size(), filename)
-
-	log.Printf("验证文件: %s (大小: %s)\n", filename, formatBytes(info.Size()))
-	log.Printf("期望SHA256: %s\n", expectedHash)
-	log.Println()
 
 	actualHash, err := generateSHA256(filename, tracker)
 	if err != nil {
 		return fmt.Errorf("无法计算SHA256: %v", err)
 	}
 
-	log.Printf("\n\n=== 验证完成 ===\n")
-	log.Printf("期望: %s\n", expectedHash)
-	log.Printf("实际: %s\n", actualHash)
-	log.Printf("用时: %s\n", formatDuration(time.Since(tracker.startTime)))
+	log.Println()
+	log.Printf("=== 验证结果 ===")
+	log.Printf("期望SHA256: %s", expectedHash)
+	log.Printf("实际SHA256: %s", actualHash)
 
 	if actualHash == expectedHash {
-		log.Printf("✓ 验证通过: %s\n", filename)
+		log.Printf("✓ 文件完整性验证通过!")
+		log.Printf("✓ 文件 %s 未被篡改", filename)
 		return nil
 	} else {
-		return fmt.Errorf("✗ 验证失败: %s", filename)
+		return fmt.Errorf("✗ 文件完整性验证失败! 文件可能已被篡改或损坏")
 	}
 }
 
 func printUsage() {
-	log.Println("SHA256 文件校验工具")
+	log.Println("SHA256 文件校验工具 v2.0")
+	log.Println("支持实时进度显示和详细速度统计")
 	log.Println()
 	log.Println("用法:")
 	log.Println("  生成模式: go run sha256_tool.go generate <file>")
 	log.Println("  验证模式: go run sha256_tool.go verify <file>")
 	log.Println()
+	log.Println("简写模式:")
+	log.Println("  生成: go run sha256_tool.go gen <file>")
+	log.Println("  生成: go run sha256_tool.go g <file>")
+	log.Println("  验证: go run sha256_tool.go check <file>")
+	log.Println("  验证: go run sha256_tool.go v <file>")
+	log.Println()
 	log.Println("说明:")
 	log.Println("  generate - 为指定文件生成 .sha256 校验文件")
 	log.Println("  verify   - 验证文件与对应的 .sha256 校验文件")
 	log.Println()
+	log.Println("功能特性:")
+	log.Println("  • 实时进度显示")
+	log.Println("  • 当前速度和平均速度统计")
+	log.Println("  • 剩余时间估算")
+	log.Println("  • 详细的文件信息显示")
+	log.Println("  • 大文件优化处理 (10MB缓冲)")
+	log.Println()
 	log.Println("示例:")
-	log.Println("  go run sha256_tool.go generate file1.txt")
-	log.Println("  go run sha256_tool.go verify file1.txt")
+	log.Println("  go run sha256_tool.go generate large_file.zip")
+	log.Println("  go run sha256_tool.go verify large_file.zip")
 }
 
 func main() {
@@ -228,6 +321,9 @@ func main() {
 
 	mode := os.Args[1]
 	filename := os.Args[2]
+
+	// 记录开始时间
+	startTime := time.Now()
 
 	var err error
 	switch mode {
@@ -245,4 +341,8 @@ func main() {
 		log.Printf("错误: %v\n", err)
 		os.Exit(1)
 	}
+
+	// 显示总体完成信息
+	totalTime := time.Since(startTime)
+	log.Printf("程序总用时: %s", formatDuration(totalTime))
 }
