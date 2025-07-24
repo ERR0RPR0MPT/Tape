@@ -1,7 +1,7 @@
 package main
 
 import (
-	"crypto/sha256"
+	"crypto/md5"
 	"fmt"
 	"io"
 	"log"
@@ -139,18 +139,18 @@ func formatDuration(d time.Duration) string {
 	}
 }
 
-// generateSHA256 计算文件的SHA256哈希值
-func generateSHA256(filename string, tracker *ProgressTracker) (string, error) {
+// generateMD5 计算文件的MD5哈希值
+func generateMD5(filename string, tracker *ProgressTracker) (string, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
 
-	hash := sha256.New()
+	hash := md5.New()
 	buffer := make([]byte, bufferSize)
 
-	log.Printf("开始计算SHA256哈希值...")
+	log.Printf("开始计算MD5哈希值...")
 	log.Printf("缓冲区大小: %s", formatBytes(bufferSize))
 	log.Println()
 
@@ -172,9 +172,9 @@ func generateSHA256(filename string, tracker *ProgressTracker) (string, error) {
 	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }
 
-// generateSHA256File 为指定文件生成SHA256文件
-func generateSHA256File(filename string) error {
-	log.Println("=== SHA256 生成模式 ===")
+// generateMD5File 为指定文件生成MD5文件
+func generateMD5File(filename string) error {
+	log.Println("=== MD5 生成模式 ===")
 
 	// 检查文件是否存在
 	info, err := os.Stat(filename)
@@ -194,33 +194,33 @@ func generateSHA256File(filename string) error {
 	log.Printf("修改时间: %s", info.ModTime().Format("2006-01-02 15:04:05"))
 	log.Println()
 
-	hash, err := generateSHA256(filename, tracker)
+	hash, err := generateMD5(filename, tracker)
 	if err != nil {
-		return fmt.Errorf("无法计算SHA256: %v", err)
+		return fmt.Errorf("无法计算MD5: %v", err)
 	}
 
-	// 保存SHA256到文件
-	sha256Filename := filename + ".sha256"
-	sha256Content := fmt.Sprintf("%s  %s\n", hash, filepath.Base(filename))
+	// 保存MD5到文件
+	md5Filename := filename + ".md5"
+	md5Content := fmt.Sprintf("%s  %s\n", hash, filepath.Base(filename))
 
-	err = os.WriteFile(sha256Filename, []byte(sha256Content), 0644)
+	err = os.WriteFile(md5Filename, []byte(md5Content), 0644)
 	if err != nil {
-		return fmt.Errorf("无法写入SHA256文件 %s: %v", sha256Filename, err)
+		return fmt.Errorf("无法写入MD5文件 %s: %v", md5Filename, err)
 	}
 
 	log.Println()
 	log.Printf("=== 生成完成 ===")
-	log.Printf("✓ SHA256值: %s", hash)
-	log.Printf("✓ 输出文件: %s", sha256Filename)
+	log.Printf("✓ MD5值: %s", hash)
+	log.Printf("✓ 输出文件: %s", md5Filename)
 
 	return nil
 }
 
-// verifySHA256File 验证文件的SHA256
-func verifySHA256File(filename string) error {
-	log.Println("=== SHA256 验证模式 ===")
+// verifyMD5File 验证文件的MD5
+func verifyMD5File(filename string) error {
+	log.Println("=== MD5 验证模式 ===")
 
-	sha256Filename := filename + ".sha256"
+	md5Filename := filename + ".md5"
 
 	// 检查原文件是否存在
 	info, err := os.Stat(filename)
@@ -232,23 +232,23 @@ func verifySHA256File(filename string) error {
 		return fmt.Errorf("不能处理目录: %s", filename)
 	}
 
-	// 检查SHA256文件是否存在
-	sha256Info, err := os.Stat(sha256Filename)
+	// 检查MD5文件是否存在
+	md5Info, err := os.Stat(md5Filename)
 	if err != nil {
-		return fmt.Errorf("SHA256文件不存在: %s", sha256Filename)
+		return fmt.Errorf("MD5文件不存在: %s", md5Filename)
 	}
 
-	// 读取SHA256文件
-	sha256Content, err := os.ReadFile(sha256Filename)
+	// 读取MD5文件
+	md5Content, err := os.ReadFile(md5Filename)
 	if err != nil {
-		return fmt.Errorf("无法读取SHA256文件 %s: %v", sha256Filename, err)
+		return fmt.Errorf("无法读取MD5文件 %s: %v", md5Filename, err)
 	}
 
-	// 解析SHA256内容
-	line := strings.TrimSpace(string(sha256Content))
+	// 解析MD5内容
+	line := strings.TrimSpace(string(md5Content))
 	parts := strings.Fields(line)
 	if len(parts) < 1 {
-		return fmt.Errorf("SHA256文件 %s 格式错误", sha256Filename)
+		return fmt.Errorf("MD5文件 %s 格式错误", md5Filename)
 	}
 
 	expectedHash := parts[0]
@@ -256,23 +256,23 @@ func verifySHA256File(filename string) error {
 	log.Printf("目标文件: %s", filename)
 	log.Printf("文件大小: %s", formatBytes(info.Size()))
 	log.Printf("修改时间: %s", info.ModTime().Format("2006-01-02 15:04:05"))
-	log.Printf("校验文件: %s", sha256Filename)
-	log.Printf("校验文件创建时间: %s", sha256Info.ModTime().Format("2006-01-02 15:04:05"))
-	log.Printf("期望SHA256: %s", expectedHash)
+	log.Printf("校验文件: %s", md5Filename)
+	log.Printf("校验文件创建时间: %s", md5Info.ModTime().Format("2006-01-02 15:04:05"))
+	log.Printf("期望MD5: %s", expectedHash)
 	log.Println()
 
 	tracker := &ProgressTracker{}
 	tracker.reset(info.Size(), filename)
 
-	actualHash, err := generateSHA256(filename, tracker)
+	actualHash, err := generateMD5(filename, tracker)
 	if err != nil {
-		return fmt.Errorf("无法计算SHA256: %v", err)
+		return fmt.Errorf("无法计算MD5: %v", err)
 	}
 
 	log.Println()
 	log.Printf("=== 验证结果 ===")
-	log.Printf("期望SHA256: %s", expectedHash)
-	log.Printf("实际SHA256: %s", actualHash)
+	log.Printf("期望MD5: %s", expectedHash)
+	log.Printf("实际MD5: %s", actualHash)
 
 	if actualHash == expectedHash {
 		log.Printf("✓ 文件完整性验证通过!")
@@ -284,22 +284,22 @@ func verifySHA256File(filename string) error {
 }
 
 func printUsage() {
-	log.Println("SHA256 文件校验工具 v2.0")
+	log.Println("MD5 文件校验工具 v2.0")
 	log.Println("支持实时进度显示和详细速度统计")
 	log.Println()
 	log.Println("用法:")
-	log.Println("  生成模式: go run sha256_tool.go generate <file>")
-	log.Println("  验证模式: go run sha256_tool.go verify <file>")
+	log.Println("  生成模式: go run md5_tool.go generate <file>")
+	log.Println("  验证模式: go run md5_tool.go verify <file>")
 	log.Println()
 	log.Println("简写模式:")
-	log.Println("  生成: go run sha256_tool.go gen <file>")
-	log.Println("  生成: go run sha256_tool.go g <file>")
-	log.Println("  验证: go run sha256_tool.go check <file>")
-	log.Println("  验证: go run sha256_tool.go v <file>")
+	log.Println("  生成: go run md5_tool.go gen <file>")
+	log.Println("  生成: go run md5_tool.go g <file>")
+	log.Println("  验证: go run md5_tool.go check <file>")
+	log.Println("  验证: go run md5_tool.go v <file>")
 	log.Println()
 	log.Println("说明:")
-	log.Println("  generate - 为指定文件生成 .sha256 校验文件")
-	log.Println("  verify   - 验证文件与对应的 .sha256 校验文件")
+	log.Println("  generate - 为指定文件生成 .md5 校验文件")
+	log.Println("  verify   - 验证文件与对应的 .md5 校验文件")
 	log.Println()
 	log.Println("功能特性:")
 	log.Println("  • 实时进度显示")
@@ -309,8 +309,8 @@ func printUsage() {
 	log.Println("  • 大文件优化处理 (10MB缓冲)")
 	log.Println()
 	log.Println("示例:")
-	log.Println("  go run sha256_tool.go generate large_file.zip")
-	log.Println("  go run sha256_tool.go verify large_file.zip")
+	log.Println("  go run md5_tool.go generate large_file.zip")
+	log.Println("  go run md5_tool.go verify large_file.zip")
 }
 
 func main() {
@@ -328,9 +328,9 @@ func main() {
 	var err error
 	switch mode {
 	case "generate", "gen", "g":
-		err = generateSHA256File(filename)
+		err = generateMD5File(filename)
 	case "verify", "check", "v":
-		err = verifySHA256File(filename)
+		err = verifyMD5File(filename)
 	default:
 		log.Printf("错误: 未知模式 '%s'\n\n", mode)
 		printUsage()
