@@ -4,10 +4,6 @@
 
 整理好的源数据请见 [index.xlsx](https://github.com/ERR0RPR0MPT/Tape/blob/main/index.xlsx)
 
-CSV 表格格式请见 [index.csv](https://github.com/ERR0RPR0MPT/Tape/blob/main/index.csv)
-
-AI 生成的索引整理说明请见 [INDEX.md](https://github.com/ERR0RPR0MPT/Tape/blob/main/INDEX.md)
-
 ## 数据存取方案：LTFS + LTFS ZIP Archiver
 
 经过多个方案的尝试，我选择 LTFS + LTFS ZIP Archiver 直接写入数据到磁带 (LTO 5+)。
