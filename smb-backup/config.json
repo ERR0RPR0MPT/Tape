@@ -1,0 +1,15 @@
+{
+  "routines": 12,
+  "pool_size": 12,
+  "src_path": [
+    "C:\\Users\\Weclont\\Desktop\\A061"
+  ],
+  "host": "192.168.0.111",
+  "port": 445,
+  "username": "Weclont",
+  "password": "",
+  "share": "e",
+  "dest_path": "android-backup",
+  "buffer_size": 2097152,
+  "retry_times": 3
+}

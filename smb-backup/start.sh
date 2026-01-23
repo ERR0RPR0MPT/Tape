@@ -1,0 +1,1 @@
+nohup /data/local/tmp/smb-backup/smb-backup >/dev/null 2>&1 &
