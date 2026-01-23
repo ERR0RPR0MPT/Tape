@@ -2,3 +2,4 @@
 .vscode
 ~$index.xlsx
 __pycache__
+/smb-backup/config-bak.json
