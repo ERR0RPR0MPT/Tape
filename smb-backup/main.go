@@ -58,6 +58,8 @@ type SMBPool struct {
 	config    *Config
 	closeOnce sync.Once
 	wg        sync.WaitGroup
+	mu        sync.Mutex
+	closed    bool
 }
 
 // 全局目录创建锁，避免并发创建同一目录
@@ -123,6 +125,135 @@ func (dc *DirCreator) EnsureDir(share *smb2.Share, path string) error {
 	return err
 }
 
+// isTCPConnectionError 判断是否为 TCP 网络连接错误（需要无限重试）
+// 这类错误表示底层网络连接出现问题，需要重新建立连接并无限重试
+func isTCPConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errMsg := strings.ToLower(err.Error())
+
+	// TCP 层面的连接错误特征
+	tcpIndicators := []string{
+		"read tcp",                            // TCP 读取错误
+		"write tcp",                           // TCP 写入错误
+		"connection refused",                  // 连接被拒绝
+		"connection reset",                    // 连接被重置
+		"connection abort",                    // 连接中止
+		"software caused connection abort",    // 软件导致连接中止
+		"broken pipe",                         // 管道破裂
+		"i/o timeout",                         // I/O 超时
+		"network is unreachable",              // 网络不可达
+		"no route to host",                    // 无路由到主机
+		"connection timed out",                // 连接超时
+		"transport endpoint is not connected", // 传输端点未连接
+		"use of closed network connection",    // 使用已关闭的网络连接
+	}
+
+	for _, indicator := range tcpIndicators {
+		if strings.Contains(errMsg, indicator) {
+			return true
+		}
+	}
+
+	// 特殊处理 EOF：如果是纯 EOF 或包含 connection 相关的 EOF，认为是连接错误
+	if strings.Contains(errMsg, "eof") {
+		// 排除 "unexpected eof" 在文件传输中的情况（可能是文件损坏）
+		// 但如果同时包含 connection 相关字样，仍然认为是连接错误
+		if strings.Contains(errMsg, "connection") {
+			return true
+		}
+		// 纯 EOF 也可能是连接断开
+		if errMsg == "eof" || strings.HasSuffix(errMsg, "eof") {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isSMBSessionError 判断是否为 SMB 会话层错误（需要重新连接但按 retry_times 重试）
+// 这类错误表示 SMB 会话失效，需要重新认证，但可能是暂时的或配置问题
+func isSMBSessionError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errMsg := strings.ToLower(err.Error())
+
+	// SMB 会话相关错误，但排除 TCP 层面的错误
+	// 必须先确认不是 TCP 连接错误
+	if isTCPConnectionError(err) {
+		return false
+	}
+
+	// SMB 会话特定的错误
+	smbSessionIndicators := []string{
+		"user session deleted",           // 用户会话被删除
+		"network name deleted",           // 网络名称被删除
+		"logon failure",                  // 登录失败
+		"authentication failed",          // 认证失败
+		"access denied",                  // 访问被拒绝（可能是会话过期）
+		"invalid session",                // 无效会话
+		"session expired",                // 会话过期
+		"status_network_session_expired", // SMB 状态码
+		"status_user_session_deleted",    // SMB 状态码
+	}
+
+	for _, indicator := range smbSessionIndicators {
+		if strings.Contains(errMsg, indicator) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isFileSystemError 判断是否为文件系统操作错误（按 retry_times 重试）
+// 这类错误表示文件系统层面的问题，可能是路径、权限、文件状态等问题
+func isFileSystemError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errMsg := strings.ToLower(err.Error())
+
+	// 确保不是 TCP 或 SMB 会话错误
+	if isTCPConnectionError(err) || isSMBSessionError(err) {
+		return false
+	}
+
+	// 文件系统特定的错误
+	fsErrorIndicators := []string{
+		"not a directory",                                    // 不是目录
+		"is not a directory",                                 // 不是目录
+		"a requested opened file is not a directory",         // Windows SMB 错误
+		"file exists",                                        // 文件已存在
+		"cannot create a file when that file already exists", // 文件已存在
+		"permission denied",                                  // 权限被拒绝
+		"no such file or directory",                          // 文件或目录不存在
+		"directory not empty",                                // 目录非空
+		"invalid argument",                                   // 无效参数
+		"file name too long",                                 // 文件名太长
+		"disk quota exceeded",                                // 磁盘配额超出
+		"no space left",                                      // 磁盘空间不足
+		"read-only file system",                              // 只读文件系统
+		"status_not_a_directory",                             // SMB 状态码
+		"status_object_name_collision",                       // SMB 对象名冲突
+		"status_object_name_invalid",                         // SMB 对象名无效
+		"status_object_path_invalid",                         // SMB 路径无效
+	}
+
+	for _, indicator := range fsErrorIndicators {
+		if strings.Contains(errMsg, indicator) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func NewSMBPool(config *Config, size int) (*SMBPool, error) {
 	// 限制最大连接数
 	if size > 16 {
@@ -133,6 +264,7 @@ func NewSMBPool(config *Config, size int) (*SMBPool, error) {
 	pool := &SMBPool{
 		connChan: make(chan *SMBConnection, size),
 		config:   config,
+		closed:   false,
 	}
 
 	// 预创建所有连接
@@ -193,8 +325,51 @@ func (p *SMBPool) Get(timeout time.Duration) (*SMBConnection, error) {
 	}
 }
 
+// RecreateConnection 重建损坏的连接
+func (p *SMBPool) RecreateConnection(oldConn *SMBConnection) (*SMBConnection, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.closed {
+		return nil, fmt.Errorf("pool is closed")
+	}
+
+	// 关闭旧连接
+	if oldConn != nil {
+		p.closeConnection(oldConn)
+	}
+
+	// 创建新连接
+	id := 0
+	if oldConn != nil {
+		id = oldConn.id
+	}
+
+	share, session, err := p.createConnection(id)
+	if err != nil {
+		return nil, fmt.Errorf("failed to recreate connection: %v", err)
+	}
+
+	newConn := &SMBConnection{
+		session: session,
+		share:   share,
+		id:      id,
+	}
+
+	return newConn, nil
+}
+
 func (p *SMBPool) Put(conn *SMBConnection) {
 	if conn != nil {
+		p.mu.Lock()
+		closed := p.closed
+		p.mu.Unlock()
+
+		if closed {
+			p.closeConnection(conn)
+			return
+		}
+
 		select {
 		case p.connChan <- conn:
 		default:
@@ -215,6 +390,10 @@ func (p *SMBPool) closeConnection(conn *SMBConnection) {
 
 func (p *SMBPool) Close() {
 	p.closeOnce.Do(func() {
+		p.mu.Lock()
+		p.closed = true
+		p.mu.Unlock()
+
 		close(p.connChan)
 		count := 0
 		for conn := range p.connChan {
@@ -326,34 +505,33 @@ func scanFiles(paths []string, taskChan chan<- FileTask, stats *Stats) {
 }
 
 func uploadFile(pool *SMBPool, task FileTask, config *Config, stats *Stats, dirCreator *DirCreator) error {
+	var conn *SMBConnection
 	var lastErr error
+	fileRetryCount := 0       // 用于文件传输和 SMB 会话错误的重试计数（受 retry_times 限制）
+	tcpRetryCount := 0        // 用于 TCP 连接错误的重试计数（无限重试，仅用于延迟策略）
+	consecutiveTCPErrors := 0 // 连续 TCP 错误计数
 
-	for retry := 0; retry <= config.RetryTimes; retry++ {
-		if retry > 0 {
-			log.Printf("[Retry %d/%d] %s", retry, config.RetryTimes, task.SourcePath)
-			// 重试前等待，避免立即重试
-			time.Sleep(time.Millisecond * time.Duration(100*retry))
-		}
+	for {
+		// 如果没有连接，尝试获取
+		if conn == nil {
+			timeout := 10 * time.Second
+			var err error
+			conn, err = pool.Get(timeout)
 
-		// 获取连接，设置超时时间
-		timeout := 5 * time.Second
-		if retry > 0 {
-			timeout = 10 * time.Second
-		}
-
-		conn, err := pool.Get(timeout)
-		if err != nil {
-			lastErr = fmt.Errorf("failed to get SMB connection: %v", err)
-			continue
+			if err != nil {
+				tcpRetryCount++
+				log.Printf("[Connection Pool Error] Failed to get connection (attempt %d): %v", tcpRetryCount, err)
+				time.Sleep(time.Second * time.Duration(min(tcpRetryCount, 30)))
+				continue // 无限重试获取连接
+			}
 		}
 
 		// 执行上传
-		err = uploadFileOnce(conn.share, task, config, dirCreator)
-
-		// 立即归还连接
-		pool.Put(conn)
+		err := uploadFileOnce(conn.share, task, config, dirCreator)
 
 		if err == nil {
+			// 上传成功
+			pool.Put(conn)
 			atomic.AddInt64(&stats.ProcessedFiles, 1)
 			atomic.AddInt64(&stats.ProcessedBytes, task.Size)
 			if config.Verbose {
@@ -362,12 +540,122 @@ func uploadFile(pool *SMBPool, task FileTask, config *Config, stats *Stats, dirC
 			return nil
 		}
 
-		lastErr = err
-	}
+		// 判断错误类型（按优先级判断）
+		if isTCPConnectionError(err) {
+			// 类型 1: TCP 连接错误 - 无限重试
+			consecutiveTCPErrors++
+			tcpRetryCount++
 
-	atomic.AddInt64(&stats.FailedFiles, 1)
-	log.Printf("[FAILED] %s - %v", task.SourcePath, lastErr)
-	return lastErr
+			log.Printf("[TCP Connection Error] %s (TCP retry #%d): %v - Will retry indefinitely...",
+				task.SourcePath, consecutiveTCPErrors, err)
+
+			// 尝试重建连接
+			newConn, recreateErr := pool.RecreateConnection(conn)
+			if recreateErr != nil {
+				log.Printf("[TCP Connection Error] Failed to recreate connection: %v - Waiting before retry...", recreateErr)
+				conn = nil
+				// 等待后继续重试，使用指数退避
+				waitTime := time.Duration(min(consecutiveTCPErrors, 30)) * time.Second
+				time.Sleep(waitTime)
+			} else {
+				log.Printf("[TCP Connection Restored] Connection recreated successfully, retrying upload...")
+				conn = newConn
+				// 短暂等待后重试
+				time.Sleep(time.Millisecond * 500)
+			}
+			// 继续循环重试，不增加 fileRetryCount
+			continue
+
+		} else if isSMBSessionError(err) {
+			// 类型 2: SMB 会话错误 - 需要重新连接，但按 retry_times 计数
+			consecutiveTCPErrors = 0 // 重置 TCP 错误计数
+			fileRetryCount++
+			lastErr = err
+
+			if fileRetryCount <= config.RetryTimes {
+				log.Printf("[SMB Session Error - Retry %d/%d] %s: %v - Recreating connection...",
+					fileRetryCount, config.RetryTimes, task.SourcePath, err)
+
+				// 尝试重建连接
+				newConn, recreateErr := pool.RecreateConnection(conn)
+				if recreateErr != nil {
+					log.Printf("[SMB Session Error] Failed to recreate connection: %v", recreateErr)
+					conn = nil
+					time.Sleep(time.Millisecond * time.Duration(200*fileRetryCount))
+				} else {
+					log.Printf("[SMB Session Restored] Connection recreated, retrying upload...")
+					conn = newConn
+					time.Sleep(time.Millisecond * time.Duration(200*fileRetryCount))
+				}
+				continue
+			} else {
+				// 超过重试次数
+				if conn != nil {
+					pool.Put(conn)
+				}
+				atomic.AddInt64(&stats.FailedFiles, 1)
+				log.Printf("[FAILED] %s - SMB Session Error: %v (after %d retries)",
+					task.SourcePath, lastErr, config.RetryTimes)
+				return lastErr
+			}
+
+		} else if isFileSystemError(err) {
+			// 类型 3: 文件系统错误 - 按 retry_times 重试
+			consecutiveTCPErrors = 0 // 重置 TCP 错误计数
+			fileRetryCount++
+			lastErr = err
+
+			if fileRetryCount <= config.RetryTimes {
+				log.Printf("[File System Error - Retry %d/%d] %s: %v",
+					fileRetryCount, config.RetryTimes, task.SourcePath, err)
+
+				// 归还当前连接（连接可能仍然可用）
+				pool.Put(conn)
+				conn = nil
+
+				// 等待后重试
+				time.Sleep(time.Millisecond * time.Duration(100*fileRetryCount))
+				continue
+			} else {
+				// 超过重试次数，标记失败
+				if conn != nil {
+					pool.Put(conn)
+				}
+				atomic.AddInt64(&stats.FailedFiles, 1)
+				log.Printf("[FAILED] %s - File System Error: %v (after %d retries)",
+					task.SourcePath, lastErr, config.RetryTimes)
+				return lastErr
+			}
+
+		} else {
+			// 类型 4: 未分类的错误 - 按文件传输错误处理（按 retry_times 重试）
+			consecutiveTCPErrors = 0 // 重置 TCP 错误计数
+			fileRetryCount++
+			lastErr = err
+
+			if fileRetryCount <= config.RetryTimes {
+				log.Printf("[Unknown Error - Retry %d/%d] %s: %v",
+					fileRetryCount, config.RetryTimes, task.SourcePath, err)
+
+				// 归还当前连接
+				pool.Put(conn)
+				conn = nil
+
+				// 等待后重试
+				time.Sleep(time.Millisecond * time.Duration(100*fileRetryCount))
+				continue
+			} else {
+				// 超过重试次数，标记失败
+				if conn != nil {
+					pool.Put(conn)
+				}
+				atomic.AddInt64(&stats.FailedFiles, 1)
+				log.Printf("[FAILED] %s - Unknown Error: %v (after %d retries)",
+					task.SourcePath, lastErr, config.RetryTimes)
+				return lastErr
+			}
+		}
+	}
 }
 
 func uploadFileOnce(share *smb2.Share, task FileTask, config *Config, dirCreator *DirCreator) error {
@@ -513,11 +801,17 @@ func main() {
 	log.Printf("Configuration loaded:")
 	log.Printf("  Routines: %d", config.Routines)
 	log.Printf("  Pool Size: %d", config.PoolSize)
-	log.Printf("  Retry Times: %d", config.RetryTimes)
+	log.Printf("  Retry Times: %d (for SMB session and file system errors)", config.RetryTimes)
 	log.Printf("  Buffer Size: %d bytes", config.BufferSize)
 	log.Printf("  Verbose: %v", config.Verbose)
 	log.Printf("  Source paths: %v", config.SrcPath)
 	log.Printf("  Destination: //%s/%s/%s", config.Host, config.Share, config.DestPath)
+	log.Printf("")
+	log.Printf("Error Handling Strategy:")
+	log.Printf("  - TCP Connection Errors: Retry indefinitely with exponential backoff")
+	log.Printf("  - SMB Session Errors: Retry up to %d times with connection recreation", config.RetryTimes)
+	log.Printf("  - File System Errors: Retry up to %d times", config.RetryTimes)
+	log.Printf("")
 
 	// 初始化统计
 	stats := &Stats{

@@ -2,7 +2,8 @@
   "routines": 12,
   "pool_size": 12,
   "src_path": [
-    "C:\\Users\\Weclont\\Desktop\\A061"
+    "/data/data",
+    "/sdcard"
   ],
   "host": "192.168.0.111",
   "port": 445,
@@ -10,6 +11,6 @@
   "password": "",
   "share": "e",
   "dest_path": "android-backup",
-  "buffer_size": 2097152,
-  "retry_times": 3
+  "buffer_size": 10485760,
+  "retry_times": 0
 }
