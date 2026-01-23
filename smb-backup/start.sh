@@ -1,1 +1,1 @@
-nohup /data/local/tmp/smb-backup/smb-backup &
+nohup /data/local/tmp/smb-backup/smb-backup > /data/local/tmp/smb-backup/logs.txt 2>&1 &
